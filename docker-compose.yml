@@ -1,0 +1,22 @@
+version: '3'
+
+services:
+  pentest:
+    build: .
+    privileged: true  # Required for network interface access
+    network_mode: "host"  # Required for wireless interface access
+    volumes:
+      - ./captures:/pentest/captures
+      - ./debug.log:/pentest/debug.log
+      - /sys/class/net:/sys/class/net:ro
+      - /proc/net:/proc/net:ro
+    environment:
+      - INTERFACE=wlan1
+      - SCAN_TIME=10
+      - VERBOSE=true
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    restart: unless-stopped 
